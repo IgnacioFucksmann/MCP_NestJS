@@ -5,6 +5,7 @@ import openai
 from dotenv import load_dotenv
 import os
 import asyncio
+import pandas as pd
 
 # Configuración inicial
 load_dotenv()
@@ -17,12 +18,55 @@ st.title("Gestión de Usuarios - MCP 🚀")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Add a sidebar for user ID input
-user_id = st.sidebar.number_input(
-    "ID del usuario (para modificar/eliminar/consultar):", min_value=1, value=1
-)
+# Crear un contenedor en la sidebar para la tabla
+if "table_container" not in st.session_state:
+    st.session_state.table_container = st.sidebar.empty()
 
+
+# Función para actualizar la tabla de usuarios
+async def actualizar_tabla_usuarios():
+    try:
+        async with mcp_client as client:
+            result = await client.call_tool("api_UsuariosController_findAll")
+            users = eval(result[0].text)
+
+            # Limpiar el contenedor antes de actualizar
+            st.session_state.table_container.empty()
+
+            # Crear nuevo contenido en el contenedor
+            with st.session_state.table_container.container():
+                st.subheader("📋 Usuarios Registrados")
+                if users:
+                    df = pd.DataFrame(users)
+                    df = df[["id", "nombre", "email"]]  # No mostrar passwords
+                    df.columns = ["ID", "Nombre", "Email"]
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.info("No hay usuarios registrados")
+    except Exception as e:
+        st.session_state.table_container.empty()
+        with st.session_state.table_container.container():
+            st.error("Error al cargar usuarios")
+
+
+# Input del usuario
 user_input = st.text_input("Escribe tu mensaje:")
+
+
+def extraer_id_usuario(texto):
+    # Buscar patrones como "id=123", "ID: 123", "usuario 123", etc.
+    patrones = [
+        r"(?:id|ID)\s*[=:]\s*(\d+)",
+        r"(?:usuario|user)\s+(\d+)",
+        r"(?:número|numero|#)\s*(\d+)",
+        r"id\s+(\d+)",
+    ]
+
+    for patron in patrones:
+        match = re.search(patron, texto)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def extraer_datos_usuario(texto):
@@ -81,26 +125,27 @@ def detectar_accion(texto):
 async def procesar_mensaje(user_input):
     accion = detectar_accion(user_input)
     try:
-        async with mcp_client:  # Use context manager for the client
+        async with mcp_client as client:
             if accion == "agregar":
                 datos = extraer_datos_usuario(user_input)
                 if datos:
                     nombre, email, password = datos
-                    # Usar el tool api_UsuariosController_create
-                    result = await mcp_client.call_tool(
+                    result = await client.call_tool(
                         "api_UsuariosController_create",
                         {"nombre": nombre, "email": email, "password": password},
                     )
-                    # Parse the response
                     created_user = eval(result[0].text)
+                    # Actualizar tabla después de crear
+                    await actualizar_tabla_usuarios()
                     return f"✅ Usuario {nombre} creado exitosamente con ID {created_user['id']}"
                 else:
                     return "❌ No entendí los datos para agregar el usuario. Necesito nombre, email y contraseña."
 
             elif accion == "consultar_todos":
-                # Usar el tool api_UsuariosController_findAll
-                result = await mcp_client.call_tool("api_UsuariosController_findAll")
+                result = await client.call_tool("api_UsuariosController_findAll")
                 users = eval(result[0].text)
+                # Actualizar tabla al consultar
+                await actualizar_tabla_usuarios()
                 if users:
                     response = "📋 Usuarios encontrados:\n"
                     for user in users:
@@ -111,14 +156,23 @@ async def procesar_mensaje(user_input):
                 return "ℹ️ No hay usuarios registrados"
 
             elif accion == "consultar_uno":
-                # Usar el tool api_UsuariosController_findOne
-                result = await mcp_client.call_tool(
-                    "api_UsuariosController_findOne", {"id": user_id}
-                )
-                user = eval(result[0].text)
-                return f"👤 Usuario encontrado:\nID: {user['id']}\nNombre: {user['nombre']}\nEmail: {user['email']}"
+                user_id = extraer_id_usuario(user_input)
+                if not user_id:
+                    return "❌ Por favor, especifica el ID del usuario (ejemplo: 'consultar usuario id=5')"
+                try:
+                    result = await client.call_tool(
+                        "api_UsuariosController_findOne", {"id": user_id}
+                    )
+                    user = eval(result[0].text)
+                    return f"👤 Usuario encontrado:\nID: {user['id']}\nNombre: {user['nombre']}\nEmail: {user['email']}"
+                except Exception as e:
+                    return f"❌ No se encontró el usuario con ID {user_id}"
 
             elif accion == "modificar":
+                user_id = extraer_id_usuario(user_input)
+                if not user_id:
+                    return "❌ Por favor, especifica el ID del usuario (ejemplo: 'modificar usuario id=5 nombre=Nuevo Nombre')"
+
                 nombre_match = re.search(r"nombre\s*=\s*([\w\s]+)", user_input)
                 pass_match = re.search(
                     r"(?:contraseña|password|clave)\s*=\s*([^\s]+)", user_input
@@ -131,25 +185,35 @@ async def procesar_mensaje(user_input):
                     datos["password"] = pass_match.group(1)
 
                 if datos:
-                    # Usar el tool api_UsuariosController_update
-                    result = await mcp_client.call_tool(
-                        "api_UsuariosController_update", {"id": user_id, **datos}
-                    )
-                    updated_user = eval(result[0].text)
-                    return f"✅ Usuario con ID {user_id} actualizado exitosamente a {updated_user['nombre']}"
+                    try:
+                        result = await client.call_tool(
+                            "api_UsuariosController_update", {"id": user_id, **datos}
+                        )
+                        updated_user = eval(result[0].text)
+                        # Actualizar tabla después de modificar
+                        await actualizar_tabla_usuarios()
+                        return f"✅ Usuario con ID {user_id} actualizado exitosamente a {updated_user['nombre']}"
+                    except Exception as e:
+                        return f"❌ No se encontró el usuario con ID {user_id}"
                 else:
                     return "❌ No se especificaron datos para actualizar. Usa 'nombre=Nuevo Nombre' o 'password=nueva_contraseña'"
 
             elif accion == "eliminar":
-                # Usar el tool api_UsuariosController_remove
-                result = await mcp_client.call_tool(
-                    "api_UsuariosController_remove", {"id": user_id}
-                )
-                deleted_info = eval(result[0].text)
-                return f"✅ {deleted_info['mensaje']} (ID: {deleted_info['usuarioId']})"
+                user_id = extraer_id_usuario(user_input)
+                if not user_id:
+                    return "❌ Por favor, especifica el ID del usuario (ejemplo: 'eliminar usuario id=5')"
+                try:
+                    result = await client.call_tool(
+                        "api_UsuariosController_remove", {"id": user_id}
+                    )
+                    deleted_info = eval(result[0].text)
+                    # Actualizar tabla después de eliminar
+                    await actualizar_tabla_usuarios()
+                    return f"✅ {deleted_info['mensaje']} (ID: {deleted_info['usuarioId']})"
+                except Exception as e:
+                    return f"❌ No se encontró el usuario con ID {user_id}"
 
             else:
-                # Si no es una acción de usuario, usamos el LLM
                 return responder_llm(user_input)
 
     except Exception as e:
@@ -157,11 +221,17 @@ async def procesar_mensaje(user_input):
         return f"❌ Error: {str(e)}"
 
 
+# Actualizar tabla al inicio
+if st.sidebar.button("🔄 Actualizar Lista"):
+    asyncio.run(actualizar_tabla_usuarios())
+
 # Procesar el mensaje cuando se envía
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
     response = asyncio.run(procesar_mensaje(user_input))
     st.session_state.messages.append({"role": "assistant", "content": response})
+    # Actualizar tabla después de cada acción
+    asyncio.run(actualizar_tabla_usuarios())
 
 # Mostrar el historial de mensajes
 for message in st.session_state.messages:
